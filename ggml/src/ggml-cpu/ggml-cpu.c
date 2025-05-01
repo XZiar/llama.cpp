@@ -2174,7 +2174,62 @@ static void clear_numa_thread_affinity(void) {
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
+static void set_numa_thread_affinity(int thread_n) 
+{
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    const char *thr = getenv("ggmlthr");
+    unsigned tid = 0;
+    if (thr == NULL)
+    {
+        tid = thread_n * 2;
+        tid = tid >= info.dwNumberOfProcessors ? tid + 1 : tid;
+    }
+    else if (strcmp(thr, "nosmt") == 0)
+    {
+        tid = thread_n % info.dwNumberOfProcessors;
+    }
+    else
+    {
+        tid = thread_n % info.dwNumberOfProcessors;
+        char *copy = strdup(thr);
+        unsigned numbers[128];
+        unsigned count = 0;
+        char *token = strtok(copy, ",");
+        while (token && count < 128u) 
+        {
+            numbers[count++] = atoi(token);
+            token = strtok(NULL, ",");
+        }
+        if (count > 0u)
+        {
+            tid = numbers[thread_n % count];
+            // printf("ggmlthr: [%s]([%u]) set [%d]=[%u]\n", thr, count, thread_n, tid);
+        }
+        else
+        {
+            printf("ggmlthr: [%s]\n", thr);
+        }
+    }
+    GROUP_AFFINITY mask =
+    {
+        .Group = 0,
+        .Mask = (KAFFINITY)(1u) << tid
+    };
+    BOOL ret = SetThreadGroupAffinity(GetCurrentThread(), &mask, NULL);
+    if (ret == 0)
+    {
+        char tmp[2048] = { 0 };
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+            GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            tmp, 2000, NULL);
+        fprintf(stderr, "warning: SetThreadGroupAffinity() failed: %s\n", tmp);
+    }
+    else
+    {
+        //printf("thread [%u] set [%u], aff mask: [%zx]\n", GetCurrentThreadId(), thread_n, mask.Mask);
+    }
+}
 static void clear_numa_thread_affinity(void) {}
 #endif
 
@@ -2469,6 +2524,7 @@ static bool ggml_thread_apply_affinity(bool * mask) {
         val |= mask[idx + 7] << 7;
         bitmask |= (uint64_t)val << idx;
     }
+    printf("thread [%u] aff mask: [%zx]\n", GetThreadId(h), bitmask);
 
     for (int32_t i = 64; i < GGML_MAX_N_THREADS; i++) {
         if (mask[i]) {
