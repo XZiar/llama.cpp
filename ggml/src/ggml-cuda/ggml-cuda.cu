@@ -139,6 +139,17 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 
             err = cudaMalloc(ptr, size);
         }
+#else
+        if (err == cudaSuccess) {
+            cudaMemLocation loc { cudaMemLocationTypeDevice, device };
+#if CUDART_VERSION >= 13000
+#   define _cmadv cudaMemAdvise
+#else
+#   define _cmadv cudaMemAdvise_v2
+#endif
+            CUDA_CHECK(_cmadv(*ptr, size, cudaMemAdviseSetReadMostly, loc));
+#undef _cmadv
+        }
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
@@ -1162,7 +1173,13 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     }
 
     ret->comms.resize(n_backends);
-    NCCL_CHECK(ncclCommInitAll(ret->comms.data(), n_backends, dev_ids.data()));
+    {
+        auto err_ = ncclCommInitAll(ret->comms.data(), n_backends, dev_ids.data());
+        if (err_ != ncclSuccess) {
+            GGML_LOG_WARN("failed at ncclCommInitAll: %s\n", ncclGetErrorString(err_));
+            return nullptr;
+        }
+    }
     return ret;
 #else
     // If NCCL is installed it is used by default for optimal performance.

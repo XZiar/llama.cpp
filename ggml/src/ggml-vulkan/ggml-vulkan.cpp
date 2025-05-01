@@ -273,6 +273,7 @@ enum vk_device_architecture {
     AMD_RDNA1,
     AMD_RDNA2,
     AMD_RDNA3,
+    INTEL_XEHPG,
     INTEL_XE2,
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
@@ -353,6 +354,12 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             // https://www.intel.com/content/www/us/en/content-details/824434/2024-intel-tech-tour-xe2-and-lunar-lake-s-gpu.html
             // https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/intel-xe-gpu-architecture.html
             return vk_device_architecture::INTEL_XE2;
+        } else {
+            for (const auto& properties : ext_props) {
+                if (strcmp("VK_KHR_cooperative_matrix", properties.extensionName) == 0) {
+                    return vk_device_architecture::INTEL_XEHPG;
+                }
+            }
         }
     } else if (props.vendorID == VK_VENDOR_ID_NVIDIA) {
         const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
@@ -3366,7 +3373,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
-        } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support && device->architecture == INTEL_XE2) {
+        } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support) {
             // Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
@@ -4111,7 +4118,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         m_wg_denoms = { 64,  64, 1 };
         s_wg_denoms = { 32,  32, 1 };
 
-        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE2) {
+        if (device->vendor_id == VK_VENDOR_ID_INTEL && (device->architecture == INTEL_XE2 || device->architecture == INTEL_XEHPG)) {
             // Xe2/Xe3 - bf16 warptile performance tuning
             l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, 4, 4, 1, subgroup_size_8 };
         }
@@ -5540,7 +5547,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->mul_mat_id_s[i] = true;
                 break;
             case VK_VENDOR_ID_INTEL:
-                if (!device->coopmat_support || device->architecture != INTEL_XE2) {
+                if (!device->coopmat_support) {
                     device->mul_mat_l[i] = false;
                     device->mul_mat_id_l[i] = false;
                 } else {
@@ -5928,6 +5935,9 @@ static void ggml_vk_instance_init() {
             new_props.pNext = &new_driver;
             new_driver.pNext = &new_id;
             devices[i].getProperties2(&new_props);
+
+            if (std::string_view(new_props.properties.deviceName.data()).find("Direct3D12") != std::string_view::npos)
+                continue; // ignore VulkanOn12
 
             if ((new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu || new_props.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) && ggml_vk_device_is_supported(devices[i])) {
                 // Check if there are two physical devices corresponding to the same GPU
@@ -16163,7 +16173,9 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
     case VK_VENDOR_ID_INTEL:
         // Only allowing Xe2 GPU at the moment since Xe2 GPU can gain significant performance boost,
         // while some older hardware (ex. Arc A770) has performance regressions
-        return arch == vk_device_architecture::INTEL_XE2;
+        if (const auto forcecm = getenv("coopmat"); forcecm && std::string_view("true") == forcecm)
+            return true;
+        return arch == vk_device_architecture::INTEL_XE2; // || props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
     case VK_VENDOR_ID_AMD:
         if (driver_props.driverID == vk::DriverId::eAmdProprietary || driver_props.driverID == vk::DriverId::eAmdOpenSource) {
             // Workaround for AMD proprietary driver reporting support on all GPUs
