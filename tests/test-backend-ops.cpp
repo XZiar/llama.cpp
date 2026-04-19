@@ -92,7 +92,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
     } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
-        GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
+        GGML_ASSERT(tensor->ne[0] % ggml_blck_size(tensor->type) == 0);
 
          // dummy importance matrix
         std::vector<float> imatrix(tensor->ne[0], 1.0f);
@@ -105,30 +105,32 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
 
-        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        const auto qsize = row_size*tensor->ne[1]*tensor->ne[2]*tensor->ne[3];
+        std::vector<uint8_t> dataq(qsize);
         {
             // parallel quantization by block
-            size_t blck_size = ggml_blck_size(tensor->type);
-            size_t n_blocks = nels / blck_size;
+            size_t n_per_row = tensor->ne[0]; //ggml_blck_size(tensor->type);
+            size_t n_rows = nels / n_per_row;
 
             auto quantize_thread = [&](size_t start, size_t end) {
                 ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
-                    start * blck_size, end - start, blck_size, im);
+                    start * n_per_row, end - start, n_per_row, im);
             };
 
             const size_t min_blocks_per_thread = 1;
             const size_t n_quant_threads = std::min<size_t>(std::max<size_t>(N_THREADS, 1),
-                                                            std::max<size_t>(1, n_blocks / min_blocks_per_thread));
+                                                            std::max<size_t>(1, n_rows / min_blocks_per_thread));
 
             if (n_quant_threads == 1) {
                 // single-threaded quantization: do all blocks in the current thread
-                quantize_thread(0, n_blocks);
+                quantize_thread(0, n_rows);
             } else {
                 std::vector<std::future<void>> tasks;
                 tasks.reserve(n_quant_threads);
                 for (size_t i = 0; i < n_quant_threads; i++) {
-                    size_t start =     i*n_blocks/n_quant_threads;
-                    size_t end   = (i+1)*n_blocks/n_quant_threads;
+                    size_t start =     i*n_rows/n_quant_threads;
+                    size_t end   = (i+1)*n_rows/n_quant_threads;
                     tasks.push_back(std::async(std::launch::async, quantize_thread, start, end));
                 }
                 for (auto & t : tasks) {
@@ -7957,6 +7959,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
         }
+    }
+
+    for (int i = 1; i < 10; ++i) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_K, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_K, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_K, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ5_K, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ6_K, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+
+        //test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_KSS, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_KS, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        //test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ3_KS, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_KS, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ5_KS, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        //test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_KL, GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
     }
 
 #if 0

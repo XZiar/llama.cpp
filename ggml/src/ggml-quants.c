@@ -5171,10 +5171,18 @@ static inline int best_index_iq2nl(const int8_t * values, float x) {
     return x - values[idx] < values[idx+1] - x ? idx : idx + 1;
 }
 
+static const int8_t iq3nl_index[111] = {
+  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  8,  8,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  9,
+  9,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2, 10, 10,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3, 11, 11,  4,  4,  4,  4,
+  4,  4,  4,  4,  4,  4, 12,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5, 13, 13,  6,  6,  6,  6,  6,  6,  6,  6,  6,  6,  6,
+  6,  6,  6,  6, 14, 14,  7,  7,  7,  7,  7,  7,  7,  7, 7
+};
 // Helper function: find best index in IQ3 lookup table
 static inline int best_index_iq3nl(const int8_t * values, float x) {
-    int idx = x < values[2] ? (x < values[1] ? 0 : 1) : (x < values[5] ? (x < values[3] ? 2 : (x < values[4] ? 3 : 4)) : (x < values[6] ? 5 : 6));
-    return x - values[idx] < values[idx+1] - x ? idx : idx + 1;
+    int ix = (int)x - values[0];
+    if (ix < 0 || ix >= 111) return ix < 0 ? 0 : 7;
+    ix = iq3nl_index[ix];
+    return ix < 8 ? ix : x - values[ix-8] < values[ix-7] - x ? ix-8 : ix-7;
 }
 
 // Helper lookup table for fast index finding in IQ4 quantization
@@ -5476,10 +5484,17 @@ static void quantize_row_iq2_k_impl(const float * GGML_RESTRICT x, block_iq2_k *
                 for (int j = 0; j < IQ2K_BLOCK_SIZE; ++j) weight[j] = 0.25f*sigma2 + xb[j]*xb[j];
             }
             sw[ib] = 0;
+            float amax = 0;
             for (int j = 0; j < IQ2K_BLOCK_SIZE; ++j) {
                 sw[ib] += weight[j];
                 pairs[j].val = xb[j];
                 pairs[j].idx = j;
+                float ax = fabs(xb[j]);
+                amax = fmax(amax, ax);
+            }
+            if (amax < 1e-16f) {
+                scales[ib] = 0;
+                continue;
             }
 
             // Sort by value
@@ -5635,7 +5650,7 @@ static void quantize_row_iq3_k_impl(const float * GGML_RESTRICT x, block_iq3_k *
                 float ax = fabsf(xb[j]);
                 if (ax > amax) { amax = ax; max = xb[j]; }
             }
-            if (amax < 1e-9f) {
+            if (amax < 1e-16f) {
                 scales[ib] = 0;
                 continue;
             }
@@ -5868,7 +5883,7 @@ static void quantize_row_iq4_k_impl(const float * GGML_RESTRICT x, block_iq4_k *
                     amax = ax; max = xb[j];
                 }
             }
-            if (amax < 1e-30f) {
+            if (amax < 1e-16f) {
                 scales[ib] = 0;
                 continue;
             }
@@ -6047,7 +6062,7 @@ static void quantize_row_iq5_k_impl(const float * GGML_RESTRICT x, block_iq5_k *
                     amax = ax; max = xb[j];
                 }
             }
-            if (amax < 1e-30f) {
+            if (amax < 1e-16f) {
                 scales[ib] = 0;
                 continue;
             }
@@ -6259,7 +6274,7 @@ static void quantize_row_iq6_k_impl(const float * GGML_RESTRICT x, block_iq6_k *
                     amax = ax; max = xb[j];
                 }
             }
-            if (amax < 1e-30f) {
+            if (amax < 1e-16f) {
                 scales[ib] = 0;
                 continue;
             }
