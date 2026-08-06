@@ -2731,11 +2731,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
 
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data);
 
+bool ggml_thread_apply_affinity(const bool * mask);
+bool ggml_thread_apply_priority(int32_t prio);
+
 #if defined(_WIN32)
 #include "windows.h"
 
 // TODO: support > 64 CPUs
-static bool ggml_thread_apply_affinity(bool * mask) {
+bool ggml_thread_apply_affinity(const bool * mask) {
     HANDLE    h = GetCurrentThread();
     uint64_t  bitmask = 0ULL;
 
@@ -2770,7 +2773,7 @@ static bool ggml_thread_apply_affinity(bool * mask) {
     return m != 0;
 }
 
-static bool ggml_thread_apply_priority(int32_t prio) {
+bool ggml_thread_apply_priority(int32_t prio) {
     // Note that on Windows the Process Priority Class must be updated in order to set Thread priority.
     // This is up to the applications.
     DWORD p = THREAD_PRIORITY_NORMAL;
@@ -2818,13 +2821,13 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 #include <sys/types.h>
 #include <sys/resource.h>
 
-static bool ggml_thread_apply_affinity(const bool * mask) {
+bool ggml_thread_apply_affinity(const bool * mask) {
     // Not supported on Apple platforms
     UNUSED(mask);
     return true;
 }
 
-static bool ggml_thread_apply_priority(int32_t prio) {
+bool ggml_thread_apply_priority(int32_t prio) {
     struct sched_param p;
     int32_t policy = SCHED_OTHER;
     switch (prio) {
@@ -2853,7 +2856,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 #elif defined(__linux__)
 // TODO: this may not work on BSD, to be verified
 
-static bool ggml_thread_apply_affinity(const bool * mask) {
+bool ggml_thread_apply_affinity(const bool * mask) {
     cpu_set_t cpuset;
     int err;
 
@@ -2882,7 +2885,7 @@ static bool ggml_thread_apply_affinity(const bool * mask) {
     return true;
 }
 
-static bool ggml_thread_apply_priority(int32_t prio) {
+bool ggml_thread_apply_priority(int32_t prio) {
     struct sched_param p;
     int32_t policy = SCHED_OTHER;
     switch (prio) {
@@ -2909,12 +2912,12 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 
 #else // unsupported platforms
 
-static bool ggml_thread_apply_affinity(const bool * mask) {
+bool ggml_thread_apply_affinity(const bool * mask) {
     UNUSED(mask);
     return true;
 }
 
-static bool ggml_thread_apply_priority(int32_t prio) {
+bool ggml_thread_apply_priority(int32_t prio) {
     UNUSED(prio);
     return true;
 }

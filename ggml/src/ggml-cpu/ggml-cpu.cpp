@@ -37,6 +37,12 @@
 #    include <sys/types.h>
 #endif
 
+// defined in ggml-cpu.c (C linkage)
+extern "C" {
+    bool ggml_thread_apply_affinity(const bool * mask);
+    bool ggml_thread_apply_priority(int32_t prio);
+}
+
 // ggml-backend interface
 
 std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_types() {
@@ -682,6 +688,14 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_threadpool") == 0) {
         return (void *)ggml_backend_cpu_set_threadpool;
+    }
+
+    // thread affinity/priority helpers, used by other backends' threadpools
+    if (strcmp(name, "ggml_thread_apply_affinity") == 0) {
+        return (void *)ggml_thread_apply_affinity;
+    }
+    if (strcmp(name, "ggml_thread_apply_priority") == 0) {
+        return (void *)ggml_thread_apply_priority;
     }
 
     return NULL;
