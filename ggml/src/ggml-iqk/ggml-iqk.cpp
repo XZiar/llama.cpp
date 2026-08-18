@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -18,61 +19,23 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
+#include <thread>
 #include <vector>
 
-#ifdef GGML_USE_OPENMP
-#include <omp.h>
-#endif
+struct iqk_compute_state_shared;
+
+using iqk_compute_callback = bool (*)(void *, int, int, int, iqk_compute_state_shared *);
 
 struct iqk_compute_state_shared {
     int n_threads;
+    int n_nodes;
+    iqk_compute_callback callback;
+    void * user_data;
     std::atomic<int> n_barrier{0};
     std::atomic<int> n_barrier_passed{0};
     std::atomic<int> ec{0};
 };
-
-using iqk_compute_callback = bool (*)(void *, int, int, int, iqk_compute_state_shared *);
-
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-
-using iqk_thread_t = HANDLE;
-using iqk_thread_ret_t = DWORD;
-
-static int iqk_thread_create(iqk_thread_t * out, iqk_thread_ret_t (*func)(void *), void * arg) {
-    HANDLE handle = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE) func, arg, 0, NULL);
-    if (handle == NULL) {
-        return EAGAIN;
-    }
-
-    *out = handle;
-    return 0;
-}
-
-static int iqk_thread_join(iqk_thread_t thread) {
-    const int ret = (int) WaitForSingleObject(thread, INFINITE);
-    CloseHandle(thread);
-    return ret;
-}
-#else
-#include <pthread.h>
-#include <sched.h>
-
-using iqk_thread_t = pthread_t;
-using iqk_thread_ret_t = void *;
-
-static int iqk_thread_create(iqk_thread_t * out, iqk_thread_ret_t (*func)(void *), void * arg) {
-    return pthread_create(out, NULL, func, arg);
-}
-
-static int iqk_thread_join(iqk_thread_t thread) {
-    return pthread_join(thread, NULL);
-}
-#endif
 
 static void iqk_thread_cpu_relax(void) {
 #if defined(_WIN32)
@@ -94,14 +57,19 @@ static void iqk_thread_yield(void) {
 #endif
 }
 
+// bitmask covering bits [begin, end); handles end == 64 where 1ULL << 64 is UB
+static uint64_t iqk_mask_bits(uint32_t begin, uint32_t end) {
+    if (end == 64) {
+        return ~0ULL << begin;
+    }
+    return (1ULL << end) - (1ULL << begin);
+}
+
 static void iqk_barrier(iqk_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
 
-#ifdef GGML_USE_OPENMP
-#pragma omp barrier
-#else
     const int n_passed = shared->n_barrier_passed.load(std::memory_order_relaxed);
     const int n_barrier = shared->n_barrier.fetch_add(1, std::memory_order_seq_cst);
 
@@ -132,76 +100,215 @@ done:
 #else
     std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
-#endif
 }
 
-struct iqk_compute_state {
-    iqk_thread_t thrd;
-    int ith;
-    int n_nodes;
-    iqk_compute_state_shared * shared;
-    iqk_compute_callback callback;
-    void * user_data;
+enum class iqk_threadpool_state {
+    idle,
+    config,
+    compute,
+    stop,
 };
 
-static iqk_thread_ret_t iqk_graph_worker(void * arg) {
-    iqk_compute_state * state = (iqk_compute_state *) arg;
+// Persistent threadpool. Worker threads are spawned on demand and reused
+// across graphs. The main thread only dispatches and waits.
+struct iqk_threadpool {
+    std::mutex mutex;
+    std::condition_variable cond;      // signaled when a new graph is dispatched
+    std::condition_variable cond_sync; // main waits for all workers to reach a sync point
 
-    for (int i = 0; i < state->n_nodes; ++i) {
-        if (!state->callback(state->user_data, i, state->ith, state->shared->n_threads, state->shared)) {
-            state->shared->ec.store(1, std::memory_order_relaxed);
+    // current graph (set under mutex before kickoff, read by workers)
+    iqk_compute_state_shared * shared = nullptr;
+
+    std::atomic<uint64_t> act_mask{0}; // bitmask of workers still to act on the current state
+    std::atomic<iqk_threadpool_state> state{iqk_threadpool_state::idle};
+
+    std::vector<std::thread> threads;
+
+    // thread affinity/priority helpers, lazily resolved from the CPU backend
+    bool (*apply_affinity)(const bool *) = nullptr;
+    bool (*apply_priority)(int32_t) = nullptr;
+
+    // CPU placement params, forwarded from the CPU backend via private API
+    ggml_threadpool_params params = {};
+    std::vector<int> cpu_ids; // CPU indices allowed by the mask
+
+    // store the CPU placement params; only update when they actually changed
+    void set_params(const ggml_threadpool_params & tpp) {
+        if (ggml_threadpool_params_match(&params, &tpp)) {
+            return;
         }
-        iqk_barrier(state->shared);
+        params = tpp;
+
+        // collect the CPU indices allowed by the mask and build the log string
+        cpu_ids.clear();
+        std::string ids;
+        for (int i = 0; i < 64; ++i) {
+            if (params.cpumask[i]) {
+                cpu_ids.push_back(i);
+                if (!ids.empty()) {
+                    ids += ",";
+                }
+                ids += std::to_string(i);
+            }
+        }
+        GGML_LOG_INFO("IQK: threadpool cpu mask: %s\n", ids.c_str());
+
+        // trigger all workers to re-apply the config and wait for them to finish
+        dispatch(threads.size(), iqk_threadpool_state::config);
     }
 
-    return 0;
-}
+    // resolve the CPU backend helpers once; safe to call from resize (the only
+    // place that spawns threads), the CPU backend is registered by then
+    void ensure_thread_funcs() {
+        if (apply_affinity && apply_priority) {
+            return;
+        }
+        ggml_backend_reg_t cpu_reg = ggml_backend_reg_by_name("CPU");
+        if (cpu_reg) {
+            apply_affinity = (bool (*)(const bool *)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_thread_apply_affinity");
+            apply_priority = (bool (*)(int32_t)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_thread_apply_priority");
+            GGML_LOG_INFO("IQK: resolved CPU thread helpers (affinity=%d priority=%d)\n",
+                    apply_affinity != nullptr, apply_priority != nullptr);
+        }
+    }
 
-static bool iqk_graph_compute(int n_nodes, int n_threads, iqk_compute_callback callback, void * user_data) {
-    iqk_compute_state_shared shared;
-    shared.n_threads = n_threads > 0 ? n_threads : 1;
+    void graph_worker(uint32_t ith) {
+        for (int i = 0; i < shared->n_nodes; ++i) {
+            if (!shared->callback(shared->user_data, i, (int) ith, shared->n_threads, shared)) {
+                shared->ec.store(1, std::memory_order_relaxed);
+            }
+            // the last node needs no barrier: returning from graph_worker
+            // syncs all workers via act_mask in dispatch()
+            if (i + 1 < shared->n_nodes) {
+                iqk_barrier(shared);
+            }
+        }
+    }
 
-#ifdef GGML_USE_OPENMP
-#pragma omp parallel num_threads(shared.n_threads)
-    {
-        #pragma omp single
+    // apply priority and affinity for worker ith; thread ith binds to cpu_ids[ith]
+    void apply_thread_config(uint32_t ith) {
+        if (apply_priority) {
+            apply_priority(params.prio);
+        }
+        if (apply_affinity && ith < cpu_ids.size()) {
+            bool mask[GGML_MAX_N_THREADS] = {false};
+            mask[cpu_ids[ith]] = true;
+            apply_affinity(mask);
+        }
+    }
+
+    void worker(uint32_t ith) {
+        // worker ith uses bit ith
+        const uint64_t bit = 1ULL << ith;
+
+        apply_thread_config(ith);
+
+        while (true) {
+            // clear this worker's bit; the last worker wakes the main thread.
+            if (act_mask.fetch_and(~bit, std::memory_order_relaxed) == bit) {
+                std::lock_guard<std::mutex> lock(mutex);
+                cond_sync.notify_one();
+            }
+
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                // wake only when this worker's bit is set
+                cond.wait(lock, [&] {
+                    return (act_mask.load(std::memory_order_relaxed) & bit) != 0;
+                });
+            }
+
+            switch (state.load(std::memory_order_acquire)) {
+                case iqk_threadpool_state::stop:
+                    return;
+                case iqk_threadpool_state::config:
+                    apply_thread_config(ith);
+                    break;
+                case iqk_threadpool_state::compute:
+                    graph_worker(ith);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    // dispatch a state change to all workers and wait for them to finish.
+    // `count` is the number of worker threads; workers cover bits 0..count-1.
+    void dispatch(size_t count, iqk_threadpool_state st) {
+        if (count == 0) {
+            return;
+        }
         {
-            shared.n_threads = omp_get_num_threads();
+            std::lock_guard<std::mutex> lock(mutex);
+            state.store(st, std::memory_order_relaxed);
+            act_mask.store(iqk_mask_bits(0, (uint32_t) count), std::memory_order_relaxed);
         }
-
-        iqk_compute_state state = {
-            {}, omp_get_thread_num(), n_nodes, &shared, callback, user_data,
-        };
-        iqk_graph_worker(&state);
-    }
-#else
-    std::vector<iqk_compute_state> workers(shared.n_threads);
-    for (int i = 0; i < shared.n_threads; ++i) {
-        workers[i] = {
-            {}, i, n_nodes, &shared, callback, user_data,
-        };
-    }
-
-    for (int i = 1; i < shared.n_threads; ++i) {
-        if (iqk_thread_create(&workers[i].thrd, iqk_graph_worker, &workers[i]) != 0) {
-            std::abort();
+        cond.notify_all();
+        if (st == iqk_threadpool_state::stop) {
+            for (auto & t : threads) {
+                t.join();
+            }
+            threads.clear();
+        } else {
+            std::unique_lock<std::mutex> lock(mutex);
+            cond_sync.wait(lock, [&] {
+                return act_mask.load(std::memory_order_relaxed) == 0;
+            });
+            state.store(iqk_threadpool_state::idle, std::memory_order_relaxed);
         }
     }
 
-    iqk_graph_worker(&workers[0]);
-
-    for (int i = 1; i < shared.n_threads; ++i) {
-        iqk_thread_join(workers[i].thrd);
+    // grow the pool; must be called while no graph is running
+    void resize(uint32_t n_threads) {
+        std::unique_lock<std::mutex> lock(mutex);
+        // act_mask is a uint64_t, so at most 64 workers
+        n_threads = std::min(n_threads, 64u);
+        const uint32_t old = (uint32_t) threads.size();
+        if (n_threads <= old) {
+            return;
+        }
+        ensure_thread_funcs();
+        GGML_LOG_INFO("IQK: threadpool resize %u -> %u\n", old, n_threads);
+        threads.reserve(n_threads);
+        // set the bits for the new workers before spawning them
+        act_mask.store(iqk_mask_bits(old, n_threads), std::memory_order_relaxed);
+        for (uint32_t i = old; i < n_threads; ++i) {
+            threads.emplace_back(&iqk_threadpool::worker, this, i);
+        }
+        // wait for all new workers to clear their bits before returning
+        cond_sync.wait(lock, [&] {
+            return act_mask.load(std::memory_order_relaxed) == 0;
+        });
     }
-#endif
 
-    return shared.ec.load(std::memory_order_relaxed) == 0;
-}
+    void stop() {
+        dispatch(threads.size(), iqk_threadpool_state::stop);
+    }
+
+    bool compute(int n_nodes, uint32_t n_threads, iqk_compute_callback callback, void * user_data) {
+        iqk_compute_state_shared shared;
+        shared.n_threads = n_threads > 0 ? (int) n_threads : 1;
+        shared.n_nodes = n_nodes;
+        shared.callback = callback;
+        shared.user_data = user_data;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            this->shared = &shared;
+        }
+
+        dispatch((size_t) shared.n_threads, iqk_threadpool_state::compute);
+
+        return shared.ec.load(std::memory_order_relaxed) == 0;
+    }
+};
 
 struct ggml_backend_iqk_context {
     int n_threads = 1;
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
+    iqk_threadpool threadpool;
 };
 
 struct mmid_row_mapping {
@@ -248,6 +355,7 @@ struct ggml_iqk_compute_context {
     std::vector<ggml_iqk_fusion_plan> fusion_plans;
     std::vector<int> fusion_start_plan;
     std::vector<uint8_t> fusion_skip;
+    char * work_data = nullptr;
 };
 
 static bool ggml_iqk_glu_enabled() {
@@ -681,12 +789,13 @@ static void ggml_iqk_log_fused_node(const ggml_tensor * node) {
     }
 }
 
-static bool ggml_iqk_quantize_src1(ggml_backend_iqk_context * ctx, const ggml_tensor * src1,
-        enum ggml_type type, int ith, int nth, iqk_compute_state_shared * shared,
-        const void ** data, size_t * row_size);
+static size_t ggml_iqk_src1_work_size(const ggml_tensor * src1, enum ggml_type type);
+static void ggml_iqk_quantize_src1(char * work_data, const ggml_tensor * src1,
+        enum ggml_type type, int ith, int nth, size_t * row_size, const void ** data);
+static size_t ggml_iqk_graph_work_size(const ggml_cgraph * cgraph);
 
 static bool ggml_iqk_compute_forward_fused(
-        ggml_backend_iqk_context * ctx,
+        char * work_data,
         const ggml_iqk_fusion_plan & plan,
         ggml_iqk_node_state * state,
         int ith,
@@ -702,9 +811,10 @@ static bool ggml_iqk_compute_forward_fused(
     const enum ggml_type typeB = ggml_iqk_vec_dot_type(gate_weight->type);
     const void * input_data = nullptr;
     size_t input_row_size = 0;
-    if (!ggml_iqk_quantize_src1(ctx, input, typeB, ith, nth, shared, &input_data, &input_row_size)) {
-        return false;
-    }
+
+    ggml_iqk_quantize_src1(work_data, input, typeB, ith, nth, &input_row_size, &input_data);
+
+    iqk_barrier(shared);
 
     const int64_t nx = plan.merged ? gate_mat->ne[0]/2 : gate_mat->ne[0];
     const size_t up_stride = up_weight->nb[1];
@@ -884,29 +994,20 @@ static void ggml_iqk_quantize_row(enum ggml_type type, const float * src, void *
     }
 }
 
-static char * ggml_iqk_reserve_work_data(ggml_backend_iqk_context * ctx, size_t size) {
-    if (ctx->work_size < size) {
-        ctx->work_data.reset(new char[size]);
-        ctx->work_size = size;
-    }
-    return ctx->work_data.get();
+static size_t ggml_iqk_src1_work_size(const ggml_tensor * src1, enum ggml_type type) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+    const size_t row_size = ggml_row_size(type, src1->ne[0]);
+    return row_size * src1->ne[1] * src1->ne[2] * src1->ne[3];
 }
 
-static bool ggml_iqk_quantize_src1(ggml_backend_iqk_context * ctx, const ggml_tensor * src1,
-        enum ggml_type type, int ith, int nth, iqk_compute_state_shared * shared,
-        const void ** data, size_t * row_size) {
+static void ggml_iqk_quantize_src1(char * work_data, const ggml_tensor * src1,
+        enum ggml_type type, int ith, int nth, size_t * row_size, const void ** data) {
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
     *row_size = ggml_row_size(type, src1->ne[0]);
     const size_t plane_size = *row_size * src1->ne[1];
     const size_t volume_size = plane_size * src1->ne[2];
-    if (ith == 0) {
-        ggml_iqk_reserve_work_data(ctx, volume_size * src1->ne[3]);
-    }
-
-    iqk_barrier(shared);
-
-    char * work_data = ctx->work_data.get();
 
     for (int64_t i13 = 0; i13 < src1->ne[3]; ++i13) {
         for (int64_t i12 = 0; i12 < src1->ne[2]; ++i12) {
@@ -918,14 +1019,11 @@ static bool ggml_iqk_quantize_src1(ggml_backend_iqk_context * ctx, const ggml_te
         }
     }
 
-    iqk_barrier(shared);
-
     *data = work_data;
-    return true;
 }
 
 static bool ggml_iqk_compute_forward_mul_mat(
-        ggml_backend_iqk_context * ctx,
+        char * work_data,
     ggml_tensor * dst,
     int ith,
     int nth,
@@ -938,9 +1036,10 @@ static bool ggml_iqk_compute_forward_mul_mat(
     const enum ggml_type typeB = ggml_iqk_vec_dot_type(src0->type);
     const void * src1_data;
     size_t src1_row_size;
-    if (!ggml_iqk_quantize_src1(ctx, src1, typeB, ith, nth, shared, &src1_data, &src1_row_size)) {
-        return false;
-    }
+
+    ggml_iqk_quantize_src1(work_data, src1, typeB, ith, nth, &src1_row_size, &src1_data);
+
+    iqk_barrier(shared);
 
     return iqk_mul_mat_4d(ne01, ne11, ne00,
                 ne02, ne03, ne12, ne13, nb02, nb03,
@@ -952,7 +1051,7 @@ static bool ggml_iqk_compute_forward_mul_mat(
 }
 
 static bool ggml_iqk_compute_forward_mul_mat_id(
-        ggml_backend_iqk_context * ctx,
+        char * work_data,
             ggml_tensor * dst,
             ggml_iqk_node_state * state,
             int ith,
@@ -971,9 +1070,7 @@ static bool ggml_iqk_compute_forward_mul_mat_id(
     const enum ggml_type typeB = ggml_iqk_vec_dot_type(src0->type);
     const void * src1_data;
     size_t src1_row_size;
-    if (!ggml_iqk_quantize_src1(ctx, src1, typeB, ith, nth, shared, &src1_data, &src1_row_size)) {
-        return false;
-    }
+    ggml_iqk_quantize_src1(work_data, src1, typeB, ith, nth, &src1_row_size, &src1_data);
 
     const int n_ids = ids->ne[0];
     const int n_as  = ne02;
@@ -983,7 +1080,6 @@ static bool ggml_iqk_compute_forward_mul_mat_id(
             const int32_t i02 = *(const int32_t *)((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
             if (i02 < 0 || i02 >= n_as) {
                 std::memset((char *)dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
-                continue;
             }
         }
     }
@@ -1031,6 +1127,7 @@ static const char * ggml_backend_iqk_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_iqk_free(ggml_backend_t backend) {
     ggml_backend_iqk_context * ctx = (ggml_backend_iqk_context *)backend->context;
+    ctx->threadpool.stop();
     delete ctx;
     delete backend;
 }
@@ -1038,7 +1135,6 @@ static void ggml_backend_iqk_free(ggml_backend_t backend) {
 static bool ggml_iqk_compute_node(void * user_data, int node_index, int ith, int nth,
         iqk_compute_state_shared * shared) {
     ggml_iqk_compute_context * compute_ctx = (ggml_iqk_compute_context *) user_data;
-    ggml_backend_iqk_context * ctx = compute_ctx->backend;
     struct ggml_tensor * node = compute_ctx->cgraph->nodes[node_index];
 
     if (compute_ctx->fusion_skip[node_index]) {
@@ -1048,10 +1144,10 @@ static bool ggml_iqk_compute_node(void * user_data, int node_index, int ith, int
     const int plan_index = compute_ctx->fusion_start_plan[node_index];
     if (plan_index >= 0) {
         const ggml_iqk_fusion_plan & plan = compute_ctx->fusion_plans[plan_index];
-        const bool fused = ggml_iqk_compute_forward_fused(ctx, plan,
+        const bool fused = ggml_iqk_compute_forward_fused(compute_ctx->work_data, plan,
                 &(*compute_ctx->node_states)[node_index], ith, nth, shared);
         if (fused) {
-            ggml_iqk_log_fused_node(plan.glu);
+            // ggml_iqk_log_fused_node(plan.glu);
         }
         return fused;
     }
@@ -1063,9 +1159,9 @@ static bool ggml_iqk_compute_node(void * user_data, int node_index, int ith, int
     ggml_iqk_node_state * state = &(*compute_ctx->node_states)[node_index];
     switch (node->op) {
         case GGML_OP_MUL_MAT:
-            return ggml_iqk_compute_forward_mul_mat(ctx, node, ith, nth, shared);
+            return ggml_iqk_compute_forward_mul_mat(compute_ctx->work_data, node, ith, nth, shared);
         case GGML_OP_MUL_MAT_ID:
-            return ggml_iqk_compute_forward_mul_mat_id(ctx, node, state, ith, nth, shared);
+            return ggml_iqk_compute_forward_mul_mat_id(compute_ctx->work_data, node, state, ith, nth, shared);
         case GGML_OP_GLU:
             return ggml_iqk_compute_forward_glu(node, ith, nth);
         case GGML_OP_CLAMP:
@@ -1081,18 +1177,89 @@ static bool ggml_iqk_compute_node(void * user_data, int node_index, int ith, int
     }
 }
 
-static ggml_status ggml_backend_iqk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static ggml_status ggml_iqk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph, char * work_data) {
     ggml_backend_iqk_context * ctx = (ggml_backend_iqk_context *)backend->context;
+
     std::vector<ggml_iqk_node_state> node_states(cgraph->n_nodes);
     ggml_iqk_compute_context compute_ctx = { ctx, cgraph, &node_states };
+    compute_ctx.work_data = work_data;
     ggml_iqk_build_fusion_plans(&compute_ctx);
 
-    if (!iqk_graph_compute(cgraph->n_nodes, ctx->n_threads, ggml_iqk_compute_node, &compute_ctx)) {
+    GGML_ASSERT(ctx->n_threads > 0 && !ctx->threadpool.threads.empty());
+    const uint32_t n_threads = std::min((uint32_t) ctx->n_threads, (uint32_t) ctx->threadpool.threads.size());
+    if (!ctx->threadpool.compute(cgraph->n_nodes, n_threads, ggml_iqk_compute_node, &compute_ctx)) {
         GGML_LOG_ERROR("%s: IQK kernel rejected graph\n", __func__);
         return GGML_STATUS_FAILED;
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+static ggml_status ggml_backend_iqk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_iqk_context * ctx = (ggml_backend_iqk_context *)backend->context;
+
+    // fallback when graph_plan is not used: allocate the work buffer on demand
+    const size_t work_size = ggml_iqk_graph_work_size(cgraph);
+    if (ctx->work_size < work_size) {
+        GGML_LOG_INFO("IQK: compute enlarge word data [%zu] -> [%zu]\n", ctx->work_size, work_size);
+        ctx->work_data.reset(new char[work_size]);
+        ctx->work_size = work_size;
+    }
+
+    return ggml_iqk_graph_compute_impl(backend, cgraph, ctx->work_data.get());
+}
+
+// total work buffer needed to quantize src1 for every matmul node in the graph
+static size_t ggml_iqk_graph_work_size(const ggml_cgraph * cgraph) {
+    size_t work_size = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const ggml_tensor * src1 = node->src[1];
+        if (src1 == nullptr || src1->type != GGML_TYPE_F32) {
+            continue;
+        }
+        const enum ggml_type typeB = ggml_iqk_vec_dot_type(node->src[0]->type);
+        work_size = std::max(work_size, ggml_iqk_src1_work_size(src1, typeB));
+    }
+    return work_size;
+}
+
+struct ggml_backend_plan_iqk {
+    ggml_backend_iqk_context * ctx;
+    ggml_cgraph * cgraph;
+    std::unique_ptr<char[]> work_data;
+    size_t work_size;
+};
+
+static ggml_backend_graph_plan_t ggml_backend_iqk_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+    ggml_backend_iqk_context * ctx = (ggml_backend_iqk_context *)backend->context;
+
+    ggml_backend_plan_iqk * plan = new ggml_backend_plan_iqk;
+    plan->ctx = ctx;
+    plan->cgraph = (ggml_cgraph *) cgraph;
+    plan->work_size = ggml_iqk_graph_work_size(cgraph);
+    if (plan->work_size > 0) {
+        plan->work_data.reset(new char[plan->work_size]);
+    }
+    GGML_LOG_INFO("IQK: create plan [%p] with [%zu] word data\n", (void*)plan, plan->work_size);
+
+    return plan;
+}
+
+static void ggml_backend_iqk_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
+    ggml_backend_plan_iqk * iqk_plan = (ggml_backend_plan_iqk *) plan;
+    GGML_LOG_INFO("IQK: free plan [%p]\n", (void*)plan);
+    delete iqk_plan;
+
+    GGML_UNUSED(backend);
+}
+
+static enum ggml_status ggml_backend_iqk_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
+    ggml_backend_plan_iqk * iqk_plan = (ggml_backend_plan_iqk *) plan;
+    return ggml_iqk_graph_compute_impl(backend, iqk_plan->cgraph, iqk_plan->work_data.get());
 }
 
 static struct ggml_backend_i ggml_backend_iqk_i = {
@@ -1104,10 +1271,10 @@ static struct ggml_backend_i ggml_backend_iqk_i = {
     /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ NULL,
-    /* .graph_plan_create       = */ NULL,
-    /* .graph_plan_free         = */ NULL,
+    /* .graph_plan_create       = */ ggml_backend_iqk_graph_plan_create,
+    /* .graph_plan_free         = */ ggml_backend_iqk_graph_plan_free,
     /* .graph_plan_update       = */ NULL,
-    /* .graph_plan_compute      = */ NULL,
+    /* .graph_plan_compute      = */ ggml_backend_iqk_graph_plan_compute,
     /* .graph_compute           = */ ggml_backend_iqk_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
@@ -1141,6 +1308,16 @@ void ggml_backend_iqk_set_n_threads(ggml_backend_t backend_iqk, int n_threads) {
 
     ggml_backend_iqk_context * ctx = (ggml_backend_iqk_context *)backend_iqk->context;
     ctx->n_threads = n_threads;
+
+    // grow the persistent threadpool on demand
+    ctx->threadpool.resize(n_threads);
+}
+
+static void ggml_backend_iqk_set_threadpool_params(ggml_backend_t backend_iqk, const ggml_threadpool_params * params) {
+    GGML_ASSERT(ggml_backend_is_iqk(backend_iqk));
+
+    ggml_backend_iqk_context * ctx = (ggml_backend_iqk_context *)backend_iqk->context;
+    ctx->threadpool.set_params(*params);
 }
 
 static const char * ggml_backend_iqk_device_get_name(ggml_backend_dev_t dev) {
@@ -1293,6 +1470,9 @@ static ggml_backend_dev_t ggml_backend_iqk_reg_get_device(ggml_backend_reg_t reg
 static void * ggml_backend_iqk_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_set_n_threads") == 0) {
         return (void *) ggml_backend_iqk_set_n_threads;
+    }
+    if (std::strcmp(name, "ggml_backend_iqk_set_threadpool_params") == 0) {
+        return (void *) ggml_backend_iqk_set_threadpool_params;
     }
     return NULL;
 
